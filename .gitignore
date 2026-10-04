@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env*
+!.env.example
+.firebase/
+*-debug.log
+*.tsbuildinfo
+.DS_Store
+backups/
+*service-account*.json
+daybook-backup-import.json
+Data Import/
