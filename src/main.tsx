@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   onAuthStateChanged,
@@ -24,6 +24,17 @@ function App() {
     [isSignUp, setIsSignUp] = useState(false),
     [showChangePassword, setShowChangePassword] = useState(false),
     [newPassword, setNewPassword] = useState("");
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const accountMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!accountMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (!accountMenuRef.current?.contains(e.target as Node))
+        setAccountMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [accountMenuOpen]);
   useEffect(() => {
     if (!auth) {
       setLoading(false);
@@ -115,158 +126,177 @@ function App() {
   return (
     <>
       <div className="account-tools">
-        <span>{user.email}</span>
-        <details>
-          <summary>Data backup</summary>
-          <div className="backup-options">
-            <p>
-              Import preserves existing tasks. Save any comment edits before
-              importing.
-            </p>
-            <label>
-              Restore task backup
-              <input
-                type="file"
-                accept=".json,application/json"
-                disabled={busy}
-                onChange={async (e) => {
-                  const file = e.target.files?.[0];
-                  if (!file) return;
-                  setBusy(true);
-                  try {
-                    const backup = JSON.parse(await file.text());
-                    const result = await restoreBackup(
-                      backup,
-                      (n, total) => setMessage(`Importing ${n} of ${total}…`),
-                    );
-                    setMessage(
-                      `Imported ${result.imported}; preserved ${result.skipped} existing tasks.`,
-                    );
-                    setRevision((x) => x + 1);
-                  } catch (e) {
-                    setMessage(
-                      (e as Error).message + " You can retry the same file.",
-                    );
-                  } finally {
-                    setBusy(false);
-                    e.target.value = "";
-                  }
-                }}
-              />
-            </label>
-            <button
-              disabled={busy}
-              onClick={async () => {
-                setBusy(true);
-                try {
-                  const r = await taskRequest("/api/tasks");
-                  if (!r.ok) throw Error("Unable to export backup.");
-                  const { tasks } = await r.json();
-                  const url = URL.createObjectURL(
-                    new Blob(
-                      [
-                        JSON.stringify(
-                          {
-                            format: "daybook-v3",
-                            exportedAt: new Date().toISOString(),
-                            tasks: tasks.map((t: Task) => {
-                              const task: any = {
-                                id: t.id,
-                                title: t.title,
-                                day: t.day,
-                                comment: t.comment,
-                                done: t.done,
-                                version: t.version,
-                              };
-                              if (t.time !== undefined) task.time = t.time;
-                              if (t.source_id !== undefined) task.source_id = t.source_id;
-                              if (t.label !== undefined) task.label = t.label;
-                              return task;
-                            }),
-                          },
-                          null,
-                          2,
-                        ),
-                      ],
-                      { type: "application/json" },
-                    ),
-                  );
-                  const a = document.createElement("a");
-                  a.href = url;
-                  a.download = "daybook-backup.json";
-                  a.click();
-                  setTimeout(() => URL.revokeObjectURL(url), 1000);
-                } catch (e) {
-                  setMessage((e as Error).message);
-                } finally {
-                  setBusy(false);
-                }
-              }}
-            >
-              Download JSON backup
-            </button>
-          </div>
-        </details>
-        <button
-          disabled={busy}
-          onClick={() => setShowChangePassword(!showChangePassword)}
-        >
-          Change password
-        </button>
-        {showChangePassword && (
-          <form
-            className="change-password-form"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              setBusy(true);
-              setMessage("");
-              try {
-                await updatePassword(user, newPassword);
-                setMessage("Password updated successfully!");
-                setNewPassword("");
-                setShowChangePassword(false);
-              } catch (error: any) {
-                setMessage(
-                  "Could not update password. " + (error.message || "You may need to re-sign in first."),
-                );
-              } finally {
-                setBusy(false);
-              }
-            }}
+        <div className="account-menu" ref={accountMenuRef}>
+          <button
+            className="account-menu-btn"
+            aria-label="Account menu"
+            aria-expanded={accountMenuOpen}
+            onClick={() => setAccountMenuOpen((o) => !o)}
           >
-            <label>
-              New password
-              <input
-                type="password"
-                autoComplete="new-password"
-                required
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-              />
-            </label>
-            <button type="submit" disabled={busy}>
-              {busy ? "Updating…" : "Update password"}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setShowChangePassword(false);
-                setNewPassword("");
-              }}
-            >
-              Cancel
-            </button>
-          </form>
-        )}
-        <button
-          disabled={busy}
-          onClick={async () => {
-            if (window.confirm("Sign out? Save any comment edits first."))
-              await signOut(auth!);
-          }}
-        >
-          Sign out
-        </button>
+            <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+              <path d="M2 4.5h14M2 9h14M2 13.5h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            </svg>
+          </button>
+          {accountMenuOpen && (
+            <div className="account-menu-panel">
+              <div className="account-email">{user.email}</div>
+              <details>
+                <summary>Data backup</summary>
+                <div className="backup-options">
+                  <p>
+                    Import preserves existing tasks. Save any comment edits
+                    before importing.
+                  </p>
+                  <label>
+                    Restore task backup
+                    <input
+                      type="file"
+                      accept=".json,application/json"
+                      disabled={busy}
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        setBusy(true);
+                        try {
+                          const backup = JSON.parse(await file.text());
+                          const result = await restoreBackup(
+                            backup,
+                            (n, total) =>
+                              setMessage(`Importing ${n} of ${total}…`),
+                          );
+                          setMessage(
+                            `Imported ${result.imported}; preserved ${result.skipped} existing tasks.`,
+                          );
+                          setRevision((x) => x + 1);
+                        } catch (e) {
+                          setMessage(
+                            (e as Error).message + " You can retry the same file.",
+                          );
+                        } finally {
+                          setBusy(false);
+                          e.target.value = "";
+                        }
+                      }}
+                    />
+                  </label>
+                  <button
+                    disabled={busy}
+                    onClick={async () => {
+                      setBusy(true);
+                      try {
+                        const r = await taskRequest("/api/tasks");
+                        if (!r.ok) throw Error("Unable to export backup.");
+                        const { tasks } = await r.json();
+                        const url = URL.createObjectURL(
+                          new Blob(
+                            [
+                              JSON.stringify(
+                                {
+                                  format: "daybook-v3",
+                                  exportedAt: new Date().toISOString(),
+                                  tasks: tasks.map((t: Task) => {
+                                    const task: any = {
+                                      id: t.id,
+                                      title: t.title,
+                                      day: t.day,
+                                      comment: t.comment,
+                                      done: t.done,
+                                      version: t.version,
+                                    };
+                                    if (t.time !== undefined) task.time = t.time;
+                                    if (t.source_id !== undefined) task.source_id = t.source_id;
+                                    if (t.label !== undefined) task.label = t.label;
+                                    return task;
+                                  }),
+                                },
+                                null,
+                                2,
+                              ),
+                            ],
+                            { type: "application/json" },
+                          ),
+                        );
+                        const a = document.createElement("a");
+                        a.href = url;
+                        a.download = "daybook-backup.json";
+                        a.click();
+                        setTimeout(() => URL.revokeObjectURL(url), 1000);
+                      } catch (e) {
+                        setMessage((e as Error).message);
+                      } finally {
+                        setBusy(false);
+                      }
+                    }}
+                  >
+                    Download JSON backup
+                  </button>
+                </div>
+              </details>
+              <button
+                className="menu-item"
+                disabled={busy}
+                onClick={() => setShowChangePassword(!showChangePassword)}
+              >
+                Change password
+              </button>
+              {showChangePassword && (
+                <form
+                  className="change-password-form"
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    setBusy(true);
+                    setMessage("");
+                    try {
+                      await updatePassword(user, newPassword);
+                      setMessage("Password updated successfully!");
+                      setNewPassword("");
+                      setShowChangePassword(false);
+                    } catch (error: any) {
+                      setMessage(
+                        "Could not update password. " + (error.message || "You may need to re-sign in first."),
+                      );
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                >
+                  <label>
+                    New password
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      required
+                      value={newPassword}
+                      onChange={(e) => setNewPassword(e.target.value)}
+                    />
+                  </label>
+                  <button type="submit" disabled={busy}>
+                    {busy ? "Updating…" : "Update password"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowChangePassword(false);
+                      setNewPassword("");
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </form>
+              )}
+              <button
+                className="menu-item"
+                disabled={busy}
+                onClick={async () => {
+                  if (window.confirm("Sign out? Save any comment edits first."))
+                    await signOut(auth!);
+                }}
+              >
+                Sign out
+              </button>
+            </div>
+          )}
+        </div>
       </div>
       {message && (
         <div className="backup-status" role="status">

@@ -7,13 +7,11 @@ import {
   ChevronLeft,
   ChevronRight,
   BookOpen,
-  MessageSquare,
   Pencil,
   X,
   Trash2,
   Download,
   Search,
-  ChevronUp,
   ChevronDown,
   Tag,
   Plus as PlusIcon,
@@ -103,8 +101,150 @@ export default function Home() {
   const [newLabelName, setNewLabelName] = useState("");
   const [labelError, setLabelError] = useState("");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [labelPickerFor, setLabelPickerFor] = useState<string | null>(null);
+  const [labelQuery, setLabelQuery] = useState("");
+  const [editLabelsOpen, setEditLabelsOpen] = useState(false);
+  const [labelsSectionOpen, setLabelsSectionOpen] = useState(false);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [saveMsg, setSaveMsg] = useState("");
   const tasksRef = useRef<Task[]>([]);
   tasksRef.current = tasks;
+  const editingRef = useRef<Task | null>(null);
+  editingRef.current = editing;
+  const editDirty = useRef<Set<keyof Task>>(new Set());
+  const queuedTask = useRef<Task | null>(null);
+  const saveDrain = useRef<Promise<void> | null>(null);
+  const saveFailed = useRef(false);
+  const composing = useRef(false);
+  const autosaveTimer = useRef(0);
+
+  function queueAutosave(task?: Task) {
+    const t = task ?? editingRef.current;
+    if (!t) return;
+    queuedTask.current = t;
+    if (!saveDrain.current) {
+      saveDrain.current = drainAutosave().finally(() => {
+        saveDrain.current = null;
+      });
+    }
+  }
+  // Serializes autosaves so an older, slower request can never overwrite a
+  // newer edit, and merges only dirty fields onto the freshest known task.
+  async function drainAutosave() {
+    while (queuedTask.current) {
+      const next = queuedTask.current;
+      queuedTask.current = null;
+      if (!next.title.trim()) {
+        saveFailed.current = true;
+        setSaveState("error");
+        setSaveMsg("Add a title to save this task.");
+        continue;
+      }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(next.day)) {
+        saveFailed.current = true;
+        setSaveState("error");
+        setSaveMsg("Pick a valid date to save.");
+        continue;
+      }
+      const base = tasksRef.current.find((x) => x.id === next.id);
+      const dirty = [...editDirty.current];
+      const payload: Task = { ...(base ?? next) } as Task;
+      for (const f of dirty) {
+        (payload as Record<string, unknown>)[f] = next[f];
+      }
+      payload.id = next.id;
+      payload.version = Math.max(base?.version ?? 0, next.version);
+      setSaveState("saving");
+      try {
+        const r = await taskRequest("/api/tasks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) {
+          if (r.status === 409) {
+            await refresh();
+            queuedTask.current = editingRef.current ?? next;
+            continue;
+          }
+          throw Error("Couldn't save your latest changes.");
+        }
+        const saved = (await r.json()).task as Task;
+        setTasks((old) => old.map((x) => (x.id === saved.id ? saved : x)));
+        for (const f of dirty) {
+          if (editingRef.current?.[f] === payload[f as keyof Task])
+            editDirty.current.delete(f);
+        }
+        setEditing((prev) =>
+          prev && prev.id === saved.id ? { ...prev, version: saved.version } : prev,
+        );
+        saveFailed.current = false;
+        setSaveState("saved");
+        setSaveMsg("");
+      } catch (e) {
+        saveFailed.current = true;
+        setSaveState("error");
+        setSaveMsg((e as Error).message || "Couldn't save your latest changes.");
+        break;
+      }
+    }
+  }
+  function applyEdit(patch: Partial<Task>) {
+    const cur = editingRef.current;
+    if (!cur) return;
+    const next = { ...cur, ...patch };
+    for (const k of Object.keys(patch)) editDirty.current.add(k as keyof Task);
+    setEditing(next);
+    queueAutosave(next);
+  }
+  function scheduleTextAutosave() {
+    window.clearTimeout(autosaveTimer.current);
+    autosaveTimer.current = window.setTimeout(() => queueAutosave(), 900);
+  }
+  function onEditText(field: "title" | "comment", value: string) {
+    const cur = editingRef.current;
+    if (!cur) return;
+    const next = { ...cur, [field]: value };
+    editDirty.current.add(field);
+    setEditing(next);
+    if (!composing.current) scheduleTextAutosave();
+  }
+  function flushTextAutosave() {
+    window.clearTimeout(autosaveTimer.current);
+    queueAutosave();
+  }
+  function openEditor(t: Task) {
+    window.clearTimeout(autosaveTimer.current);
+    editDirty.current = new Set();
+    saveFailed.current = false;
+    queuedTask.current = null;
+    setSaveState("idle");
+    setSaveMsg("");
+    setLabelQuery("");
+    setEditLabelsOpen(false);
+    setLabelPickerFor(null);
+    setEditing({ ...t });
+  }
+  async function closeEditor() {
+    window.clearTimeout(autosaveTimer.current);
+    if (editingRef.current && editDirty.current.size) queueAutosave();
+    while (saveDrain.current) await saveDrain.current;
+    if (saveFailed.current) return; // keep the editor open with the error visible
+    setEditing(null);
+    setSaveState("idle");
+    setSaveMsg("");
+    setEditLabelsOpen(false);
+  }
+  // Close the card label popover on outside interaction.
+  useEffect(() => {
+    if (!labelPickerFor) return;
+    const onDown = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement).closest(".task-labels-slot"))
+        setLabelPickerFor(null);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [labelPickerFor]);
   function applyRollover(
     list: Task[],
     moved: { id: string; day: string; pending_from_date: string; version: number }[],
@@ -201,18 +341,28 @@ export default function Home() {
       .map((id) => labels.find((l) => l.id === id))
       .filter((l): l is Label => !!l);
 
+  const newLabelForTask = useRef<string | null>(null);
   async function handleCreateLabel() {
     setLabelError("");
     try {
       const label = await createLabel(newLabelName);
       setLabels((prev) => [...prev, label]);
       // Auto-select the new label in whichever form is open
-      if (editing) {
-        setEditing((prev) =>
-          prev
-            ? { ...prev, labels: [...new Set([...taskLabelIds(prev), label.id])] }
-            : prev,
-        );
+      if (editingRef.current) {
+        applyEdit({
+          labels: [...new Set([...taskLabelIds(editingRef.current), label.id])],
+          label: undefined,
+        });
+      } else if (newLabelForTask.current) {
+        const t = tasksRef.current.find((x) => x.id === newLabelForTask.current);
+        if (t) {
+          await save({
+            ...t,
+            labels: [...new Set([...taskLabelIds(t), label.id])],
+            label: undefined,
+          });
+        }
+        newLabelForTask.current = null;
       } else {
         setQuickLabelIds((prev) => [...new Set([...prev, label.id])]);
       }
@@ -602,6 +752,371 @@ export default function Home() {
       });
     }
   }
+  // Shared label menu used by the card popover and the task-details selector.
+  function renderLabelMenu(
+    currentIds: string[],
+    onToggle: (id: string) => void,
+    onClear: () => void,
+    onCreate: () => void,
+    onClose: () => void,
+  ) {
+    const q = labelQuery.trim().toLowerCase();
+    const shown = labels.filter(
+      (l) => !q || l.name.toLowerCase().includes(q),
+    );
+    const moveFocus = (e: React.KeyboardEvent, dir: 1 | -1) => {
+      const items = Array.from(
+        e.currentTarget
+          .closest(".label-menu")!
+          .querySelectorAll<HTMLElement>(".label-menu-option"),
+      );
+      const i = items.indexOf(document.activeElement as HTMLElement);
+      items[(i + dir + items.length) % items.length]?.focus();
+      e.preventDefault();
+    };
+    return (
+      <div
+        className="label-menu"
+        role="menu"
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.stopPropagation();
+            onClose();
+          }
+          if (e.key === "ArrowDown") moveFocus(e, 1);
+          if (e.key === "ArrowUp") moveFocus(e, -1);
+        }}
+      >
+        <input
+          className="label-menu-search"
+          type="search"
+          placeholder="Search labels…"
+          aria-label="Search labels"
+          value={labelQuery}
+          onChange={(e) => setLabelQuery(e.target.value)}
+        />
+        <div className="label-menu-list" role="group" aria-label="Labels">
+          {shown.map((l) => {
+            const on = currentIds.includes(l.id);
+            return (
+              <button
+                key={l.id}
+                type="button"
+                role="menuitemcheckbox"
+                aria-checked={on}
+                className={"label-menu-option" + (on ? " on" : "")}
+                onClick={() => onToggle(l.id)}
+              >
+                <span className="label-menu-name">{l.name}</span>
+                <span className="label-menu-check">
+                  {on && <Check size={13} strokeWidth={3} />}
+                </span>
+              </button>
+            );
+          })}
+          {!shown.length && (
+            <div className="label-menu-none">No matching labels</div>
+          )}
+        </div>
+        {currentIds.length > 0 && (
+          <button type="button" className="label-menu-clear" onClick={onClear}>
+            Remove all labels
+          </button>
+        )}
+        <button
+          type="button"
+          className="label-picker-new"
+          onClick={onCreate}
+        >
+          <PlusIcon size={14} />
+          Create new label
+        </button>
+      </div>
+    );
+  }
+
+  function renderTaskRow(t: Task) {
+    const tl = taskLabels(t);
+    const ids = taskLabelIds(t);
+    const pending = !t.done && !!t.pending_from_date;
+    const selected = selectedIds.includes(t.id);
+    return (
+      <div
+        className={
+          "task-row " +
+          (t.done ? "task-done " : "") +
+          (t.priority ? "task-priority " : "") +
+          (selected ? "task-row-selected" : "")
+        }
+        key={t.id}
+      >
+        <div className="task-main">
+          <button
+            className={"select-box" + (selected ? " selected" : "")}
+            aria-label={"Select " + t.title}
+            aria-pressed={selected}
+            title="Select for batch actions"
+            onClick={() => toggleTaskSelect(t.id)}
+          >
+            {selected && <Check size={11} strokeWidth={3.5} />}
+          </button>
+          <div className="task-check-col">
+            <label className="done-toggle">
+              <input
+                type="checkbox"
+                aria-label={
+                  "Mark " + t.title + (t.done ? " incomplete" : " complete")
+                }
+                checked={!!t.done}
+                disabled={busy || !!drafts[t.id]}
+                onChange={async () => {
+                  const wasDone = !!t.done;
+                  getAudioCtx().resume(); // unlock audio within the click gesture
+                  const success = await save({ ...t, done: t.done ? 0 : 1 });
+                  if (success && !wasDone) {
+                    if (t.priority) playFireSound();
+                    else playTaskCompleteSound();
+                  } else if (success) {
+                    void reconcileRollover();
+                  }
+                }}
+              />
+              <span className="done-tick" aria-hidden="true">
+                <Check size={20} strokeWidth={3} />
+              </span>
+            </label>
+            <button
+              className={"priority-btn" + (t.priority ? " active" : "")}
+              aria-label={
+                (t.priority ? "Remove priority from " : "Mark priority on ") +
+                t.title
+              }
+              aria-pressed={!!t.priority}
+              title={t.priority ? "Remove priority" : "Mark as priority"}
+              disabled={busy || !!drafts[t.id]}
+              onClick={() => save({ ...t, priority: t.priority ? 0 : 1 })}
+            >
+              🔥
+            </button>
+          </div>
+          <div className="task-content">
+            <button
+              className="task-title"
+              disabled={busy || !!drafts[t.id]}
+              onClick={() => openEditor(t)}
+            >
+              <span className="task-title-text">{t.title}</span>
+              <Pencil size={14} />
+            </button>
+            {(t.time || pending) && (
+              <div className="task-meta">
+                {t.time && (
+                  <span className="task-time">{formatTime(t.time)}</span>
+                )}
+                {pending && (
+                  <span className="pending-since">
+                    Pending since{" "}
+                    {pretty(t.pending_from_date!, {
+                      day: "numeric",
+                      month: "long",
+                      year: "numeric",
+                    })}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="task-side">
+            <div className="task-labels-slot">
+              {tl.length ? (
+                tl.map((label) => (
+                <button
+                  key={label.id}
+                  type="button"
+                  className="task-label"
+                  title={label.name}
+                  aria-label={`Label ${label.name}. Change labels for ${t.title}`}
+                  disabled={busy}
+                  onClick={() => {
+                    setLabelQuery("");
+                    setLabelPickerFor(labelPickerFor === t.id ? null : t.id);
+                  }}
+                >
+                  <Tag size={11} />
+                  <span className="task-label-name">{label.name}</span>
+                </button>
+              ))
+            ) : (
+              <button
+                type="button"
+                className="task-label-empty tip tip-center"
+                aria-label={"Add label to " + t.title}
+                data-tip="Add a label"
+                disabled={busy}
+                onClick={() => {
+                  setLabelQuery("");
+                  setLabelPickerFor(labelPickerFor === t.id ? null : t.id);
+                }}
+              >
+                <PlusIcon size={12} />
+              </button>
+            )}
+            {labelPickerFor === t.id &&
+              renderLabelMenu(
+                ids,
+                (id) => {
+                  const next = ids.includes(id)
+                    ? ids.filter((x) => x !== id)
+                    : [...ids, id];
+                  save({
+                    ...t,
+                    labels: next.length ? next : undefined,
+                    label: undefined,
+                  });
+                },
+                () => save({ ...t, labels: undefined, label: undefined }),
+                () => {
+                  newLabelForTask.current = t.id;
+                  setLabelPickerFor(null);
+                  setShowNewLabelModal(true);
+                },
+                () => setLabelPickerFor(null),
+              )}
+          </div>
+          <div className="task-row-actions">
+            <button
+              className="icon-btn tip"
+              aria-label={"Push " + t.title + " to yesterday"}
+              data-tip="Push this task yesterday"
+              disabled={busy || !!drafts[t.id]}
+              onClick={() => pushTask(t, -1)}
+            >
+              <ChevronLeft size={16} />
+            </button>
+            <button
+              className="icon-btn tip"
+              aria-label={"Push " + t.title + " to tomorrow"}
+              data-tip="Push this task tomorrow"
+              disabled={busy || !!drafts[t.id]}
+              onClick={() => pushTask(t, 1)}
+            >
+              <ChevronRight size={16} />
+            </button>
+          </div>
+          </div>
+          <div className="task-status">
+            {pending && (
+              <button
+                type="button"
+                className="pending-warn"
+                title={pendingTip(t)}
+                aria-label={pendingTip(t)}
+                data-tip={pendingTip(t)}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+              >
+                !
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="inline-comment">
+          <textarea
+            aria-label={"Comment for " + t.title}
+            rows={2}
+            maxLength={10000}
+            placeholder="Write an update…"
+            disabled={busy}
+            value={drafts[t.id]?.comment ?? t.comment}
+            onChange={(e) => {
+              const value = e.target.value;
+              setDrafts((old) => {
+                const next = { ...old };
+                if (value === t.comment) delete next[t.id];
+                else
+                  next[t.id] = {
+                    comment: value,
+                    version: old[t.id]?.version ?? t.version,
+                  };
+                return next;
+              });
+            }}
+          />
+          <div className="row-actions">
+            {drafts[t.id] && (
+              <>
+                <button
+                  className="save-comment"
+                  disabled={busy || drafts[t.id].version !== t.version}
+                  onClick={() => saveComment(t)}
+                >
+                  Save comment
+                </button>
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    setDrafts((old) => {
+                      const next = { ...old };
+                      delete next[t.id];
+                      return next;
+                    })
+                  }
+                >
+                  Discard edit
+                </button>
+              </>
+            )}
+            {deleting === t.id ? (
+              <span className="delete-confirm">
+                Delete task?
+                <button
+                  className="danger"
+                  disabled={busy}
+                  onClick={() => removeTask(t)}
+                >
+                  Delete
+                </button>
+                <button disabled={busy} onClick={() => setDeleting(null)}>
+                  Cancel
+                </button>
+              </span>
+            ) : (
+              <button
+                className="delete-task"
+                aria-label={"Delete " + t.title}
+                disabled={busy}
+                onClick={() => setDeleting(t.id)}
+              >
+                <Trash2 size={15} />
+                <span>Delete</span>
+              </button>
+            )}
+          </div>
+          {drafts[t.id] && drafts[t.id].version !== t.version && (
+            <div className="comment-conflict" role="alert">
+              This task changed elsewhere. Your draft is above. Saved comment:{" "}
+              {t.comment || "(empty)"}
+              <button
+                onClick={() =>
+                  setDrafts((old) => ({
+                    ...old,
+                    [t.id]: {
+                      ...old[t.id],
+                      version: t.version,
+                    },
+                  }))
+                }
+              >
+                Keep my draft for this version
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
   const monthLength = new Date(
     Number(month.slice(0, 4)),
     Number(month.slice(5, 7)),
@@ -640,6 +1155,7 @@ export default function Home() {
       visible.some((t) => t.day === d) &&
       visible.filter((t) => t.day === d).every((t) => t.done),
   ).length;
+  const pendingCount = tasks.filter((t) => !t.done && t.pending_from_date).length;
   const selectableTasks =
     view === "priority"
       ? tasks.filter((t) => t.priority)
@@ -669,18 +1185,29 @@ export default function Home() {
           Daily planner
         </div>
         <div className={`nav-item ${view === "pending" ? "nav-active" : ""}`} onClick={() => setView("pending")}>
-          <span className="warn-badge">!</span>
+          <span className="warn-badge" aria-label={`${pendingCount} pending`}>
+            {pendingCount}
+          </span>
           Pending tasks!
         </div>
-        <div className="sidebar-caption">LABELS</div>
+        <div
+          className={`nav-item ${view === "priority" ? "nav-active" : ""}`}
+          onClick={() => setView(view === "priority" ? "day" : "priority")}
+        >
+          <span className="priority-emoji">🔥</span>
+          Priority tasks
+        </div>
+        <button
+          type="button"
+          className="sidebar-caption labels-toggle"
+          aria-expanded={labelsSectionOpen}
+          onClick={() => setLabelsSectionOpen(!labelsSectionOpen)}
+        >
+          LABELS
+          <ChevronDown size={14} className={labelsSectionOpen ? "flip" : ""} />
+        </button>
+        {(labelsSectionOpen || view === "label" || selectedLabelIds.length > 0) && (
         <div className="labels-section">
-          <div
-            className={`label-item label-permanent ${view === "priority" ? "label-active" : ""}`}
-            onClick={() => setView(view === "priority" ? "day" : "priority")}
-          >
-            <span className="priority-emoji">🔥</span>
-            Priority
-          </div>
           {labels.map((label) => (
             <div
               key={label.id}
@@ -741,17 +1268,7 @@ export default function Home() {
             Create label
           </button>
         </div>
-        <div className="sidebar-note">
-          <span className="eyebrow">ONE DAY AT A TIME</span>
-          <p>
-            A little structure.
-            <br />A clearer mind.
-          </p>
-          <small>
-            Your tasks, updates, and finished days. All in one place.
-          </small>
-        </div>
-        <div className="private">Personal workspace</div>
+        )}
       </aside>
       <main>
         <header>
@@ -836,6 +1353,7 @@ export default function Home() {
                 <div className="label-picker-menu">
                   {labels.map((label) => (
                     <label key={label.id} className="label-picker-option">
+                      <span className="opt-name">{label.name}</span>
                       <input
                         type="checkbox"
                         checked={quickLabelIds.includes(label.id)}
@@ -847,7 +1365,6 @@ export default function Home() {
                           )
                         }
                       />
-                      {label.name}
                     </label>
                   ))}
                   <button
@@ -1047,7 +1564,7 @@ export default function Home() {
               <div className="heading">
                 <div>
                   <div className="eyebrow">
-                    {view === "priority" ? "PRIORITY" : view === "pending" ? "PENDING" : "LABELS"}
+                    {view === "priority" ? "PRIORITY TASKS" : view === "pending" ? "PENDING" : "LABELS"}
                   </div>
                   <h1>
                     {view === "priority"
@@ -1144,232 +1661,7 @@ export default function Home() {
                             <span>TASK</span>
                             <span>COMMENT / UPDATE</span>
                           </div>
-                          {dayTasks.map((t) => (
-                            <div
-                              className={
-                                "task-row " +
-                                (t.done ? "task-done " : "") +
-                                (t.priority ? "task-priority " : "") +
-                                (selectedIds.includes(t.id) ? "task-row-selected" : "")
-                              }
-                              key={t.id}
-                            >
-                              <div className="task-main">
-                                <div className="task-check-col">
-                                  <label className="done-toggle">
-                                    <input
-                                      type="checkbox"
-                                      aria-label={
-                                        "Mark " + t.title + (t.done ? " incomplete" : " complete")
-                                      }
-                                      checked={!!t.done}
-                                      disabled={busy || !!drafts[t.id]}
-                                      onChange={async () => {
-                                        const wasDone = !!t.done;
-                                        getAudioCtx().resume(); // unlock audio within the click gesture
-                                        const success = await save({ ...t, done: t.done ? 0 : 1 });
-                                        if (success && !wasDone) {
-                                          if (t.priority) playFireSound();
-                                          else playTaskCompleteSound();
-                                        } else if (success) {
-                                          void reconcileRollover();
-                                        }
-                                      }}
-                                    />
-                                    <span className="done-tick" aria-hidden="true">
-                                      <Check size={20} strokeWidth={3} />
-                                    </span>
-                                  </label>
-                                  <button
-                                    className={"priority-btn" + (t.priority ? " active" : "")}
-                                    aria-label={(t.priority ? "Remove priority from " : "Mark priority on ") + t.title}
-                                    aria-pressed={!!t.priority}
-                                    title={t.priority ? "Remove priority" : "Mark as priority"}
-                                    disabled={busy || !!drafts[t.id]}
-                                    onClick={() => save({ ...t, priority: t.priority ? 0 : 1 })}
-                                  >
-                                    🔥
-                                  </button>
-                                </div>
-                                <button
-                                  className={
-                                    "select-box" +
-                                    (selectedIds.includes(t.id) ? " selected" : "")
-                                  }
-                                  aria-label={"Select " + t.title}
-                                  aria-pressed={selectedIds.includes(t.id)}
-                                  title="Select for batch actions"
-                                  onClick={() => toggleTaskSelect(t.id)}
-                                >
-                                  {selectedIds.includes(t.id) && <Check size={11} strokeWidth={3.5} />}
-                                </button>
-                                <div className="task-content">
-                                  <button
-                                    className="task-title"
-                                    disabled={busy || !!drafts[t.id]}
-                                    onClick={() => setEditing({ ...t })}
-                                  >
-                                    {t.title}
-                                    {t.time && <span className="task-time">{formatTime(t.time)}</span>}
-                                    {taskLabels(t).map((label) => (
-                                      <span key={label.id} className="task-label">
-                                        <Tag size={12} />
-                                        {label.name}
-                                      </span>
-                                    ))}
-                                    <Pencil size={14} />
-                                  </button>
-                                  <div className="task-actions">
-                                    <button
-                                      className="push-button"
-                                      disabled={busy || !!drafts[t.id]}
-                                      onClick={() => pushTask(t, 1)}
-                                      title="Push to tomorrow"
-                                    >
-                                      <ChevronUp size={14} />
-                                      Push tomorrow
-                                    </button>
-                                    <button
-                                      className="push-button"
-                                      disabled={busy || !!drafts[t.id]}
-                                      onClick={() => pushTask(t, -1)}
-                                      title="Push to yesterday"
-                                    >
-                                      <ChevronDown size={14} />
-                                      Push yesterday
-                                    </button>
-                                  </div>
-                                  {!t.done && t.pending_from_date && (
-                                    <small className="pending-since">
-                                      Pending since{" "}
-                                      {pretty(t.pending_from_date, {
-                                        day: "numeric",
-                                        month: "long",
-                                        year: "numeric",
-                                      })}
-                                    </small>
-                                  )}
-                                </div>
-                                {!t.done && t.pending_from_date && (
-                                  <button
-                                    type="button"
-                                    className="pending-warn"
-                                    title={pendingTip(t)}
-                                    aria-label={pendingTip(t)}
-                                    data-tip={pendingTip(t)}
-                                    onClick={(e) => {
-                                      e.preventDefault();
-                                      e.stopPropagation();
-                                    }}
-                                  >
-                                    !
-                                  </button>
-                                )}
-                              </div>
-                              <div className="inline-comment">
-                                <textarea
-                                  aria-label={"Comment for " + t.title}
-                                  rows={2}
-                                  maxLength={10000}
-                                  placeholder="Write an update…"
-                                  disabled={busy}
-                                  value={drafts[t.id]?.comment ?? t.comment}
-                                  onChange={(e) => {
-                                    const value = e.target.value;
-                                    setDrafts((old) => {
-                                      const next = { ...old };
-                                      if (value === t.comment) delete next[t.id];
-                                      else
-                                        next[t.id] = {
-                                          comment: value,
-                                          version: old[t.id]?.version ?? t.version,
-                                        };
-                                      return next;
-                                    });
-                                  }}
-                                />
-                                <div className="row-actions">
-                                  {drafts[t.id] && (
-                                    <>
-                                      <button
-                                        className="save-comment"
-                                        disabled={
-                                          busy ||
-                                          drafts[t.id].version !== t.version
-                                        }
-                                        onClick={() => saveComment(t)}
-                                      >
-                                        Save comment
-                                      </button>
-                                      <button
-                                        disabled={busy}
-                                        onClick={() =>
-                                          setDrafts((old) => {
-                                            const next = { ...old };
-                                            delete next[t.id];
-                                            return next;
-                                          })
-                                        }
-                                      >
-                                        Discard edit
-                                      </button>
-                                    </>
-                                  )}
-                                  {deleting === t.id ? (
-                                    <span className="delete-confirm">
-                                      Delete task?
-                                      <button
-                                        className="danger"
-                                        disabled={busy}
-                                        onClick={() => removeTask(t)}
-                                      >
-                                        Delete
-                                      </button>
-                                      <button
-                                        disabled={busy}
-                                        onClick={() => setDeleting(null)}
-                                      >
-                                        Cancel
-                                      </button>
-                                    </span>
-                                  ) : (
-                                    <button
-                                      className="delete-task"
-                                      aria-label={"Delete " + t.title}
-                                      disabled={busy}
-                                      onClick={() => setDeleting(t.id)}
-                                    >
-                                      <Trash2 size={15} />
-                                      <span>Delete</span>
-                                    </button>
-                                  )}
-                                </div>
-                                {drafts[t.id] &&
-                                  drafts[t.id].version !== t.version && (
-                                    <div
-                                      className="comment-conflict"
-                                      role="alert"
-                                    >
-                                      This task changed elsewhere. Your draft is
-                                      above. Saved comment: {t.comment || "(empty)"}
-                                      <button
-                                        onClick={() =>
-                                          setDrafts((old) => ({
-                                            ...old,
-                                            [t.id]: {
-                                              ...old[t.id],
-                                              version: t.version,
-                                            },
-                                          }))
-                                        }
-                                      >
-                                        Keep my draft for this version
-                                      </button>
-                                    </div>
-                                  )}
-                              </div>
-                            </div>
-                          ))}
+                          {dayTasks.map(renderTaskRow)}
                         </>
                       ) : (
                         <div className="day-empty">
@@ -1456,246 +1748,7 @@ export default function Home() {
                           <span>TASK</span>
                           <span>COMMENT / UPDATE</span>
                         </div>
-                        {list.map((t) => (
-                          <div
-                            className={
-                              "task-row " +
-                              (t.done ? "task-done " : "") +
-                              (t.priority ? "task-priority " : "") +
-                              (selectedIds.includes(t.id) ? "task-row-selected" : "")
-                            }
-                            key={t.id}
-                          >
-                            <div className="task-main">
-                              <div className="task-check-col">
-                                <label className="done-toggle">
-                                  <input
-                                    type="checkbox"
-                                    aria-label={
-                                      "Mark " +
-                                      t.title +
-                                      (t.done ? " incomplete" : " complete")
-                                    }
-                                    checked={!!t.done}
-                                    disabled={busy || !!drafts[t.id]}
-                                    onChange={async () => {
-                                      const wasDone = !!t.done;
-                                      getAudioCtx().resume(); // unlock audio within the click gesture
-                                      const success = await save({ ...t, done: t.done ? 0 : 1 });
-                                      if (success && !wasDone) {
-                                        if (t.priority) playFireSound();
-                                        else playTaskCompleteSound();
-                                      } else if (success) {
-                                        void reconcileRollover();
-                                      }
-                                    }}
-                                  />
-                                  <span className="done-tick" aria-hidden="true">
-                                    <Check size={20} strokeWidth={3} />
-                                  </span>
-                                </label>
-                                <button
-                                  className={"priority-btn" + (t.priority ? " active" : "")}
-                                  aria-label={(t.priority ? "Remove priority from " : "Mark priority on ") + t.title}
-                                  aria-pressed={!!t.priority}
-                                  title={t.priority ? "Remove priority" : "Mark as priority"}
-                                  disabled={busy || !!drafts[t.id]}
-                                  onClick={() => save({ ...t, priority: t.priority ? 0 : 1 })}
-                                >
-                                  🔥
-                                </button>
-                              </div>
-                              <button
-                                className={
-                                  "select-box" +
-                                  (selectedIds.includes(t.id) ? " selected" : "")
-                                }
-                                aria-label={"Select " + t.title}
-                                aria-pressed={selectedIds.includes(t.id)}
-                                title="Select for batch actions"
-                                onClick={() => toggleTaskSelect(t.id)}
-                              >
-                                {selectedIds.includes(t.id) && <Check size={11} strokeWidth={3.5} />}
-                              </button>
-                              <div className="task-content">
-                                <button
-                                  className="task-title"
-                                  disabled={busy || !!drafts[t.id]}
-                                  onClick={() => setEditing({ ...t })}
-                                >
-                                  {t.title}
-                                  {t.time && <span className="task-time">{formatTime(t.time)}</span>}
-                                  {taskLabels(t).map((label) => (
-                                    <span key={label.id} className="task-label">
-                                      <Tag size={12} />
-                                      {label.name}
-                                    </span>
-                                  ))}
-                                  <Pencil size={14} />
-                                </button>
-                                <div className="task-actions">
-                                  {taskLabels(t).length === 0 && (
-                                    <button
-                                      className="add-label-btn"
-                                      disabled={busy || !!drafts[t.id]}
-                                      onClick={() => setEditing({ ...t })}
-                                    >
-                                      <Tag size={13} />
-                                      Add label
-                                    </button>
-                                  )}
-                                  <button
-                                    className="push-button"
-                                    disabled={busy || !!drafts[t.id]}
-                                    onClick={() => pushTask(t, 1)}
-                                    title="Push to tomorrow"
-                                  >
-                                    <ChevronUp size={14} />
-                                    Push tomorrow
-                                  </button>
-                                  <button
-                                    className="push-button"
-                                    disabled={busy || !!drafts[t.id]}
-                                    onClick={() => pushTask(t, -1)}
-                                    title="Push to yesterday"
-                                  >
-                                    <ChevronDown size={14} />
-                                    Push yesterday
-                                  </button>
-                                </div>
-                                {!t.done && t.pending_from_date && (
-                                  <small className="pending-since">
-                                    Pending since{" "}
-                                    {pretty(t.pending_from_date, {
-                                      day: "numeric",
-                                      month: "long",
-                                      year: "numeric",
-                                    })}
-                                  </small>
-                                )}
-                              </div>
-                              {!t.done && t.pending_from_date && (
-                                <button
-                                  type="button"
-                                  className="pending-warn"
-                                  title={pendingTip(t)}
-                                  aria-label={pendingTip(t)}
-                                  data-tip={pendingTip(t)}
-                                  onClick={(e) => {
-                                    e.preventDefault();
-                                    e.stopPropagation();
-                                  }}
-                                >
-                                  !
-                                </button>
-                              )}
-                            </div>
-                            <div className="inline-comment">
-                              <textarea
-                                aria-label={"Comment for " + t.title}
-                                rows={2}
-                                maxLength={10000}
-                                placeholder="Write an update…"
-                                disabled={busy}
-                                value={drafts[t.id]?.comment ?? t.comment}
-                                onChange={(e) => {
-                                  const value = e.target.value;
-                                  setDrafts((old) => {
-                                    const next = { ...old };
-                                    if (value === t.comment) delete next[t.id];
-                                    else
-                                      next[t.id] = {
-                                        comment: value,
-                                        version:
-                                          old[t.id]?.version ?? t.version,
-                                      };
-                                    return next;
-                                  });
-                                }}
-                              />
-                              <div className="row-actions">
-                                {drafts[t.id] && (
-                                  <>
-                                    <button
-                                      className="save-comment"
-                                      disabled={
-                                        busy ||
-                                        drafts[t.id].version !== t.version
-                                      }
-                                      onClick={() => saveComment(t)}
-                                    >
-                                      Save comment
-                                    </button>
-                                    <button
-                                      disabled={busy}
-                                      onClick={() =>
-                                        setDrafts((old) => {
-                                          const next = { ...old };
-                                          delete next[t.id];
-                                          return next;
-                                        })
-                                      }
-                                    >
-                                      Discard edit
-                                    </button>
-                                  </>
-                                )}
-                                {deleting === t.id ? (
-                                  <span className="delete-confirm">
-                                    Delete task?
-                                    <button
-                                      className="danger"
-                                      disabled={busy}
-                                      onClick={() => removeTask(t)}
-                                    >
-                                      Delete
-                                    </button>
-                                    <button
-                                      disabled={busy}
-                                      onClick={() => setDeleting(null)}
-                                    >
-                                      Cancel
-                                    </button>
-                                  </span>
-                                ) : (
-                                  <button
-                                    className="delete-task"
-                                    aria-label={"Delete " + t.title}
-                                    disabled={busy}
-                                    onClick={() => setDeleting(t.id)}
-                                  >
-                                    <Trash2 size={15} />
-                                    <span>Delete</span>
-                                  </button>
-                                )}
-                              </div>
-                              {drafts[t.id] &&
-                                drafts[t.id].version !== t.version && (
-                                  <div
-                                    className="comment-conflict"
-                                    role="alert"
-                                  >
-                                    This task changed elsewhere. Your draft is
-                                    above. Saved comment:{" "}
-                                    {t.comment || "(empty)"}
-                                    <button
-                                      onClick={() =>
-                                        setDrafts((old) => ({
-                                          ...old,
-                                          [t.id]: {
-                                            ...old[t.id],
-                                            version: t.version,
-                                          },
-                                        }))
-                                      }
-                                    >
-                                      Keep my draft for this version
-                                    </button>
-                                  </div>
-                                )}
-                            </div>
-                          </div>
-                        ))}
+                        {list.map(renderTaskRow)}
                       </>
                     ) : (
                       <div className="day-empty">
@@ -1742,15 +1795,15 @@ export default function Home() {
                 disabled={busy || selectedIds.length === 0}
                 onClick={() => batchPush(-1)}
               >
-                <ChevronDown size={15} />
+                <ChevronLeft size={15} />
                 Push yesterday
               </button>
               <button
                 disabled={busy || selectedIds.length === 0}
                 onClick={() => batchPush(1)}
               >
-                <ChevronUp size={15} />
                 Push tomorrow
+                <ChevronRight size={15} />
               </button>
               <button
                 className="danger"
@@ -1959,16 +2012,16 @@ export default function Home() {
         <div
           className="modal-backdrop"
           onClick={(e) => {
-            if (e.target === e.currentTarget && !busy) setEditing(null);
+            if (e.target === e.currentTarget) void closeEditor();
           }}
         >
           <section
             role="dialog"
             aria-modal="true"
             aria-labelledby="edit-title"
-            className="modal"
+            className="modal task-modal"
             onKeyDown={(e) => {
-              if (e.key === "Escape" && !busy) setEditing(null);
+              if (e.key === "Escape") void closeEditor();
               if (e.key === "Tab") {
                 const els = e.currentTarget.querySelectorAll<HTMLElement>(
                   "button:not(:disabled),input,textarea",
@@ -1985,126 +2038,238 @@ export default function Home() {
               }
             }}
           >
-            <div className="modal-heading">
+            <div className="task-modal-head">
               <h2 id="edit-title">Task details</h2>
-              <button
-                aria-label="Close edit"
-                disabled={busy}
-                onClick={() => setEditing(null)}
+              <span
+                className={"autosave-status is-" + saveState}
+                role="status"
+                aria-live="polite"
               >
-                <X />
+                {saveState === "saving" ? (
+                  "Saving…"
+                ) : saveState === "saved" ? (
+                  "Saved"
+                ) : saveState === "error" ? (
+                  <>
+                    Couldn’t save —{" "}
+                    <button type="button" onClick={() => queueAutosave()}>
+                      Retry
+                    </button>
+                  </>
+                ) : (
+                  "Autosave on"
+                )}
+              </span>
+              <button
+                aria-label="Close task details"
+                className="icon-btn"
+                onClick={() => void closeEditor()}
+              >
+                <X size={18} />
               </button>
             </div>
-            <form
-              onSubmit={async (e) => {
-                e.preventDefault();
-                if (await save(editing)) setEditing(null);
-              }}
-            >
-              <label>
+            <div className="task-modal-body">
+              <label className="field">
                 Task
                 <input
                   autoFocus
                   required
                   maxLength={500}
                   value={editing.title}
-                  onChange={(e) =>
-                    setEditing({ ...editing, title: e.target.value })
-                  }
+                  aria-invalid={!editing.title.trim()}
+                  onChange={(e) => onEditText("title", e.target.value)}
+                  onBlur={flushTextAutosave}
+                  onCompositionStart={() => (composing.current = true)}
+                  onCompositionEnd={() => {
+                    composing.current = false;
+                    scheduleTextAutosave();
+                  }}
                 />
-              </label>
-              <label>
-                Date
-                <input
-                  type="date"
-                  required
-                  value={editing.day}
-                  onChange={(e) =>
-                    setEditing({ ...editing, day: e.target.value })
-                  }
-                />
-              </label>
-              <label>
-                Time (optional)
-                <input
-                  type="time"
-                  value={editing.time || ""}
-                  onChange={(e) =>
-                    setEditing({ ...editing, time: e.target.value || undefined })
-                  }
-                />
-                {editing.time && (
-                  <small style={{ color: "#736c79", marginTop: "4px" }}>
-                    Displayed as: {formatTime(editing.time)}
-                  </small>
+                {!editing.title.trim() && (
+                  <span className="field-error" role="alert">
+                    Title can’t be empty.
+                  </span>
                 )}
               </label>
-              <fieldset className="label-fieldset">
-                <legend>Labels (optional)</legend>
-                <div className="label-checklist">
-                  {labels.map((label) => (
-                    <label key={label.id} className="label-picker-option">
-                      <input
-                        type="checkbox"
-                        checked={taskLabelIds(editing).includes(label.id)}
-                        onChange={() => {
-                          const current = taskLabelIds(editing);
-                          const next = current.includes(label.id)
-                            ? current.filter((id) => id !== label.id)
-                            : [...current, label.id];
-                          setEditing({
-                            ...editing,
-                            labels: next.length ? next : undefined,
-                            label: undefined,
-                          });
-                        }}
-                      />
-                      {label.name}
-                    </label>
-                  ))}
-                  {labels.length === 0 && (
-                    <span className="label-picker-empty">No labels yet</span>
-                  )}
+              <div className="field-row">
+                <label className="field">
+                  Date
+                  <input
+                    type="date"
+                    required
+                    value={editing.day}
+                    onChange={(e) => {
+                      if (e.target.value) applyEdit({ day: e.target.value });
+                    }}
+                  />
+                </label>
+                <label className="field">
+                  Time (optional)
+                  <input
+                    type="time"
+                    value={editing.time || ""}
+                    onChange={(e) =>
+                      applyEdit({ time: e.target.value || undefined })
+                    }
+                  />
+                </label>
+              </div>
+              {editing.time && (
+                <div className="field-hint">
+                  Displayed as {formatTime(editing.time)} — reminder 10 min
+                  before.
+                </div>
+              )}
+              <div className="field">
+                <span className="field-label" id="edit-labels-label">
+                  Labels (optional)
+                </span>
+                <div className="label-select">
                   <button
                     type="button"
-                    className="label-picker-new"
-                    onClick={() => setShowNewLabelModal(true)}
+                    className="label-select-toggle"
+                    aria-labelledby="edit-labels-label"
+                    aria-expanded={editLabelsOpen}
+                    onClick={() => {
+                      setLabelQuery("");
+                      setEditLabelsOpen(!editLabelsOpen);
+                    }}
                   >
-                    <PlusIcon size={14} />
-                    Create new label
+                    <Tag size={14} />
+                    <span className="label-select-value">
+                      {taskLabels(editing).length
+                        ? taskLabels(editing)
+                            .map((l) => l.name)
+                            .join(", ")
+                        : "No labels"}
+                    </span>
+                    <ChevronDown
+                      size={14}
+                      className={editLabelsOpen ? "flip" : ""}
+                    />
                   </button>
+                  {editLabelsOpen &&
+                    renderLabelMenu(
+                      taskLabelIds(editing),
+                      (id) => {
+                        const cur = taskLabelIds(editingRef.current ?? editing);
+                        const next = cur.includes(id)
+                          ? cur.filter((x) => x !== id)
+                          : [...cur, id];
+                        applyEdit({
+                          labels: next.length ? next : undefined,
+                          label: undefined,
+                        });
+                      },
+                      () => applyEdit({ labels: undefined, label: undefined }),
+                      () => {
+                        setEditLabelsOpen(false);
+                        setShowNewLabelModal(true);
+                      },
+                      () => setEditLabelsOpen(false),
+                    )}
                 </div>
-              </fieldset>
-              <label>
+              </div>
+              <label className="field">
                 Comment / update
                 <textarea
                   rows={5}
                   maxLength={10000}
                   placeholder="What happened? What’s next?"
                   value={editing.comment}
-                  onChange={(e) =>
-                    setEditing({ ...editing, comment: e.target.value })
-                  }
+                  onChange={(e) => onEditText("comment", e.target.value)}
+                  onBlur={flushTextAutosave}
+                  onCompositionStart={() => (composing.current = true)}
+                  onCompositionEnd={() => {
+                    composing.current = false;
+                    scheduleTextAutosave();
+                  }}
                 />
               </label>
-              {error && (
+              {saveState === "error" && (
                 <p role="alert" className="error">
-                  {error}
+                  {saveMsg}
                 </p>
               )}
-              <div className="modal-actions">
+            </div>
+            <div className="task-modal-foot">
+              {deleting === editing.id ? (
+                <span className="delete-confirm">
+                  Delete task?
+                  <button
+                    className="danger"
+                    disabled={busy}
+                    onClick={async () => {
+                      // Cancel pending autosaves so a queued write can’t
+                      // resurrect a deleted task.
+                      queuedTask.current = null;
+                      editDirty.current.clear();
+                      while (saveDrain.current) await saveDrain.current;
+                      queuedTask.current = null;
+                      await removeTask(editing);
+                      setEditing(null);
+                    }}
+                  >
+                    Delete
+                  </button>
+                  <button disabled={busy} onClick={() => setDeleting(null)}>
+                    Cancel
+                  </button>
+                </span>
+              ) : (
                 <button
                   type="button"
+                  className="delete-task modal-delete"
+                  aria-label={"Delete " + editing.title}
                   disabled={busy}
-                  onClick={() => setEditing(null)}
+                  onClick={() => setDeleting(editing.id)}
                 >
-                  Cancel
+                  <Trash2 size={15} />
+                  <span>Delete</span>
                 </button>
-                <button className="primary" disabled={busy}>
-                  {busy ? "Saving…" : "Save changes"}
+              )}
+              <div className="foot-push">
+                <button
+                  type="button"
+                  className="secondary-sm"
+                  aria-label="Push task to yesterday"
+                  title="Push to yesterday"
+                  onClick={() => {
+                    const cur = editingRef.current;
+                    if (!cur) return;
+                    const d = new Date(cur.day + "T12:00:00");
+                    d.setDate(d.getDate() - 1);
+                    applyEdit({ day: dateKey(d) });
+                  }}
+                >
+                  <ChevronLeft size={15} />
+                  Yesterday
+                </button>
+                <button
+                  type="button"
+                  className="secondary-sm"
+                  aria-label="Push task to tomorrow"
+                  title="Push to tomorrow"
+                  onClick={() => {
+                    const cur = editingRef.current;
+                    if (!cur) return;
+                    const d = new Date(cur.day + "T12:00:00");
+                    d.setDate(d.getDate() + 1);
+                    applyEdit({ day: dateKey(d) });
+                  }}
+                >
+                  Tomorrow
+                  <ChevronRight size={15} />
                 </button>
               </div>
-            </form>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void closeEditor()}
+              >
+                Done
+              </button>
+            </div>
           </section>
         </div>
       )}
