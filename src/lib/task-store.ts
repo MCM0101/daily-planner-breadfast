@@ -11,6 +11,7 @@ import {
 } from "firebase/firestore";
 import { auth, db } from "./firebase";
 import { validTask, readBackup, type Task } from "./task-validation";
+
 function taskCollection() {
   if (!db || !auth?.currentUser) throw Error("Sign in first.");
   return collection(db, "users", auth.currentUser.uid, "tasks");
@@ -32,7 +33,6 @@ export async function taskRequest(_url: string, options: RequestInit = {}) {
     if (!db || !auth?.currentUser) throw Error("Sign in first.");
     const ref = taskCollection();
     const dbNonNull = db;
-    const authNonNull = auth;
     const userId = auth.currentUser.uid;
     if (!options.method || options.method === "GET") {
       const rows = await getDocsFromServer(ref);
@@ -42,7 +42,11 @@ export async function taskRequest(_url: string, options: RequestInit = {}) {
             const data = x.data();
             const labels = labelIdsOf(data);
             delete data.label;
-            return labels.length ? { ...data, labels } : data;
+            delete data.reminder;
+            return {
+              ...data,
+              ...(labels.length ? { labels } : {}),
+            } as Record<string, unknown> & { id: string; day: string };
           })
           .sort(
             (a, b) => b.day.localeCompare(a.day) || a.id.localeCompare(b.id),
@@ -235,7 +239,9 @@ export async function rolloverOverdueTasks(
               ? d.pending_from_date
               : d.day;
           const version = (d.version || 1) + 1;
-          tx.set(ref, { ...d, day: today, pending_from_date: pending, version });
+          // Drop the leftover email-reminder field while rewriting the doc.
+          const { reminder: _oldReminder, ...rest } = d;
+          tx.set(ref, { ...rest, day: today, pending_from_date: pending, version });
           return { id: ref.id, day: today, pending_from_date: pending, version };
         });
       } catch (e) {

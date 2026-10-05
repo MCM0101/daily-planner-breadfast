@@ -107,6 +107,7 @@ export default function Home() {
   const [labelsSectionOpen, setLabelsSectionOpen] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveMsg, setSaveMsg] = useState("");
+  const [reminderAlert, setReminderAlert] = useState<Task | null>(null);
   const tasksRef = useRef<Task[]>([]);
   tasksRef.current = tasks;
   const editingRef = useRef<Task | null>(null);
@@ -380,37 +381,40 @@ export default function Home() {
     }
   }, []);
 
+  // Persists across effect re-runs so a task edit can't double-notify.
+  const notifiedTasksRef = useRef(new Set<string>());
+
   useEffect(() => {
     if (notificationPermission !== "granted") return;
 
-    const notifiedTasks = new Set<string>();
+    const LEAD_MS = 10 * 60 * 1000;
 
     const checkAndScheduleNotifications = () => {
-      const now = new Date();
-      const upcomingTasks = tasks.filter((t) => {
-        if (!t.time || t.done) return false;
-        const taskDate = new Date(t.day + "T" + t.time);
-        const timeDiff = taskDate.getTime() - now.getTime();
-        return timeDiff > 0 && timeDiff <= 10 * 60 * 1000; // Within 10 minutes
-      });
-
-      upcomingTasks.forEach((task) => {
+      const now = Date.now();
+      tasks.forEach((task) => {
+        if (!task.time || task.done) return;
         const taskDate = new Date(task.day + "T" + task.time);
-        const notificationTime = new Date(taskDate.getTime() - 10 * 60 * 1000);
-        const timeUntilNotification = notificationTime.getTime() - now.getTime();
-
-        // Check if we should notify now (within 1 minute of notification time)
-        if (timeUntilNotification <= 60000 && timeUntilNotification > 0 && !notifiedTasks.has(task.id)) {
-          notifiedTasks.add(task.id);
-          setTimeout(() => {
-            playNotificationSound();
-            new Notification("Daybook Reminder", {
-              body: `Task "${task.title}" is coming up in 10 minutes`,
-              icon: "/favicon.svg",
-              requireInteraction: true,
-            });
-          }, timeUntilNotification);
-        }
+        // Poll window extends 1 min past the lead time so the 30s poller
+        // always catches the notification moment.
+        const timeUntilNotification = taskDate.getTime() - LEAD_MS - now;
+        if (timeUntilNotification <= 0 || timeUntilNotification > 60000)
+          return;
+        const key = `${task.id}@${task.day}@${task.time}`;
+        if (notifiedTasksRef.current.has(key)) return;
+        notifiedTasksRef.current.add(key);
+        setTimeout(() => {
+          const cur = tasksRef.current.find((x) => x.id === task.id);
+          // Skip if the task was deleted, completed, or rescheduled.
+          if (!cur || cur.done || cur.day !== task.day || cur.time !== task.time)
+            return;
+          playNotificationSound();
+          setReminderAlert({ ...cur });
+          new Notification("Daybook Reminder", {
+            body: `Task "${cur.title}" is coming up in 10 minutes`,
+            icon: "/favicon.svg",
+            requireInteraction: true,
+          });
+        }, timeUntilNotification);
       });
     };
 
@@ -459,8 +463,12 @@ export default function Home() {
     }
   }
 
-  function playNotificationSound() {
-    playTone(800, 0.5);
+  async function playNotificationSound() {
+    await playTone(659.25, 0.45); // E5
+    await new Promise((r) => setTimeout(r, 160));
+    await playTone(830.61, 0.45); // G#5
+    await new Promise((r) => setTimeout(r, 160));
+    await playTone(1046.5, 1.1, 0.35); // C6 with a longer tail
   }
 
   function playTaskCompleteSound() {
@@ -2005,6 +2013,56 @@ export default function Home() {
                 </button>
               </div>
             </form>
+          </section>
+        </div>
+      )}
+      {reminderAlert && (
+        <div
+          className="modal-backdrop modal-backdrop-top"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setReminderAlert(null);
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reminder-alert-title"
+            className="modal"
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setReminderAlert(null);
+            }}
+          >
+            <div className="modal-heading">
+              <h2 id="reminder-alert-title">Reminder</h2>
+              <button aria-label="Close" onClick={() => setReminderAlert(null)}>
+                <X />
+              </button>
+            </div>
+            <p>
+              <strong>{reminderAlert.title}</strong>
+              {reminderAlert.time &&
+                ` starts at ${formatTime(reminderAlert.time)}`}
+              {reminderAlert.day !== cairoToday() &&
+                ` on ${new Date(reminderAlert.day + "T12:00:00").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}`}
+              .
+            </p>
+            <div className="modal-actions">
+              <button onClick={() => setReminderAlert(null)}>Dismiss</button>
+              <button
+                className="primary"
+                onClick={() => {
+                  const t = reminderAlert;
+                  setReminderAlert(null);
+                  if (t.day !== day) {
+                    selectDay(t.day);
+                    setView("day");
+                  }
+                  openEditor(t);
+                }}
+              >
+                Open task
+              </button>
+            </div>
           </section>
         </div>
       )}
